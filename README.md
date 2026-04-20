@@ -116,15 +116,4 @@ A plot `stock_prediction_plot.png` is also saved showing:
 - **Multi-step forecasting** — predict 5 or 30 days ahead
 - **Portfolio optimization** — apply predictions across multiple tickers
 
----
 
-## Disclaimer
-
-> This project is for educational purposes only. Stock price predictions are not financial advice and should not be used for real trading decisions.
-
----
-
-## Author
-
-AI & ML Internship Project — Stock Price Prediction  
-Dataset: Yahoo Finance API / Kaggle
