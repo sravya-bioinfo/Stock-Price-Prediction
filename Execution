@@ -1,0 +1,529 @@
+"""
+=============================================================
+  Stock Price Prediction using LSTM
+  Industry: Finance
+  Tools: Python, Pandas, TensorFlow/Keras, Matplotlib
+=============================================================
+
+Description:
+    This script predicts future stock prices using historical
+    price data and technical indicators (Moving Average, RSI).
+    An LSTM (Long Short-Term Memory) neural network is trained
+    on time-series sequences to forecast the next closing price.
+
+Steps:
+    1. Collect / load historical stock price data
+    2. Calculate technical indicators (MA, RSI)
+    3. Preprocess: normalize data, create time-series sequences
+    4. Train an LSTM model
+    5. Evaluate with RMSE and backtest against historical data
+    6. Visualize predictions vs. actual prices
+
+Dataset:
+    Yahoo Finance (via yfinance) or Kaggle Stock Data.
+    Install yfinance: pip install yfinance
+
+Usage:
+    python stock_price_prediction.py
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")           # non-interactive backend (saves PNG)
+import matplotlib.pyplot as plt
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ─── Optional imports with graceful fallback ─────────────────────────────────
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
+    KERAS_AVAILABLE = True
+except ImportError:
+    KERAS_AVAILABLE = False
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+TICKER      = "AAPL"          # Stock ticker symbol
+START_DATE  = "2018-01-01"    # Historical data start date
+END_DATE    = "2023-12-31"    # Historical data end date
+SEQ_LENGTH  = 60              # Number of past days used to predict the next day
+TEST_SPLIT  = 0.2             # 20% held out for testing
+EPOCHS      = 30              # Training epochs
+BATCH_SIZE  = 32
+PLOT_PATH   = "stock_prediction_plot.png"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — DATA COLLECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_stock_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch historical OHLCV stock data using Yahoo Finance API.
+
+    Args:
+        ticker : Stock symbol (e.g., 'AAPL')
+        start  : Start date string 'YYYY-MM-DD'
+        end    : End date string 'YYYY-MM-DD'
+
+    Returns:
+        DataFrame with columns: Open, High, Low, Close, Volume
+    """
+    if YFINANCE_AVAILABLE:
+        print(f"\n[1/6] Fetching {ticker} data from Yahoo Finance ({start} → {end})...")
+        df = yf.download(ticker, start=start, end=end, progress=False)
+        df.dropna(inplace=True)
+        print(f"    Fetched {len(df)} trading days of data.")
+        return df
+    else:
+        return generate_synthetic_stock_data()
+
+
+def generate_synthetic_stock_data() -> pd.DataFrame:
+    """
+    Generate realistic synthetic stock price data using
+    Geometric Brownian Motion (the standard financial model).
+
+    Returns:
+        DataFrame mimicking daily OHLCV data
+    """
+    print("\n[1/6] yfinance not available — generating synthetic stock data...")
+    np.random.seed(42)
+
+    n_days   = 1500
+    dates    = pd.date_range(start="2018-01-01", periods=n_days, freq="B")
+
+    # Geometric Brownian Motion parameters
+    S0     = 150.0     # initial price
+    mu     = 0.0003    # daily drift
+    sigma  = 0.015     # daily volatility
+    dt     = 1
+
+    # Simulate daily returns
+    returns = np.random.normal(mu, sigma, n_days)
+    prices  = S0 * np.cumprod(1 + returns)
+
+    # OHLCV approximation
+    noise    = np.random.uniform(0.995, 1.005, n_days)
+    df = pd.DataFrame({
+        "Open"  : prices * np.random.uniform(0.99, 1.00, n_days),
+        "High"  : prices * np.random.uniform(1.00, 1.02, n_days),
+        "Low"   : prices * np.random.uniform(0.98, 1.00, n_days),
+        "Close" : prices,
+        "Volume": np.random.randint(10_000_000, 80_000_000, n_days),
+    }, index=dates)
+
+    print(f"    Generated {len(df)} synthetic trading days.")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — TECHNICAL INDICATORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_moving_average(series: pd.Series, window: int) -> pd.Series:
+    """
+    Simple Moving Average (SMA) — smooths price data.
+
+    Args:
+        series : Closing price series
+        window : Lookback period (e.g., 20 or 50 days)
+
+    Returns:
+        SMA series
+    """
+    return series.rolling(window=window).mean()
+
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Relative Strength Index (RSI) — momentum oscillator (0–100).
+    RSI > 70 → overbought (possible sell signal)
+    RSI < 30 → oversold  (possible buy signal)
+
+    Args:
+        series : Closing price series
+        period : Lookback period (default 14 days)
+
+    Returns:
+        RSI series
+    """
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+
+    rs  = avg_gain / (avg_loss + 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add SMA-20, SMA-50, and RSI-14 to the DataFrame.
+
+    Args:
+        df : Raw stock DataFrame
+
+    Returns:
+        DataFrame with additional indicator columns
+    """
+    print("\n[2/6] Calculating technical indicators...")
+    df = df.copy()
+    df["SMA_20"] = compute_moving_average(df["Close"], 20)
+    df["SMA_50"] = compute_moving_average(df["Close"], 50)
+    df["RSI_14"] = compute_rsi(df["Close"], 14)
+
+    # Drop rows where indicators are NaN (first ~50 rows)
+    df.dropna(inplace=True)
+    print(f"    Added: SMA_20, SMA_50, RSI_14")
+    print(f"    Usable rows after indicator warm-up: {len(df)}")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — PREPROCESSING & SEQUENCE CREATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def normalize_data(df: pd.DataFrame, features: list):
+    """
+    Normalize selected features to [0, 1] using MinMaxScaler.
+
+    Args:
+        df       : DataFrame with indicator columns
+        features : List of column names to scale
+
+    Returns:
+        Tuple of (scaled_array, scaler_for_close_only)
+    """
+    scaler_all   = MinMaxScaler()
+    scaler_close = MinMaxScaler()
+
+    scaled_all   = scaler_all.fit_transform(df[features])
+    scaler_close.fit(df[["Close"]])   # separate scaler to inverse-transform predictions
+
+    return scaled_all, scaler_all, scaler_close
+
+
+def create_sequences(data: np.ndarray, seq_len: int):
+    """
+    Convert a 2D time-series array into overlapping sequences
+    suitable for LSTM input.
+
+    Input shape  : (n_timesteps, n_features)
+    Output shape : X → (n_samples, seq_len, n_features)
+                   y → (n_samples,)  [Close price index = 0]
+
+    Args:
+        data    : Scaled feature array
+        seq_len : Number of past steps per sequence
+
+    Returns:
+        Tuple of (X, y) numpy arrays
+    """
+    X, y = [], []
+    for i in range(seq_len, len(data)):
+        X.append(data[i - seq_len : i])       # seq_len past time steps
+        y.append(data[i, 0])                   # Close is feature index 0
+    return np.array(X), np.array(y)
+
+
+def preprocess(df: pd.DataFrame):
+    """
+    Full preprocessing pipeline: normalize, sequence, split.
+
+    Args:
+        df : DataFrame with indicators
+
+    Returns:
+        Tuple: (X_train, X_test, y_train, y_test, scaler_close, split_idx)
+    """
+    print("\n[3/6] Preprocessing: normalizing and creating sequences...")
+
+    features = ["Close", "SMA_20", "SMA_50", "RSI_14", "Volume"]
+    scaled, _, scaler_close = normalize_data(df, features)
+
+    X, y = create_sequences(scaled, SEQ_LENGTH)
+    print(f"    Total sequences : {len(X)}")
+    print(f"    Sequence shape  : {X.shape}")  # (n, 60, 5)
+
+    split = int(len(X) * (1 - TEST_SPLIT))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    print(f"    Train sequences : {len(X_train)}")
+    print(f"    Test  sequences : {len(X_test)}")
+
+    return X_train, X_test, y_train, y_test, scaler_close, split
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — LSTM MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_lstm_model(input_shape: tuple) -> "Sequential":
+    """
+    Build a stacked LSTM neural network.
+
+    Architecture:
+        LSTM(128) → Dropout(0.2)
+        LSTM(64)  → Dropout(0.2)
+        Dense(32) → Dense(1)
+
+    Args:
+        input_shape : (seq_length, n_features)
+
+    Returns:
+        Compiled Keras model
+    """
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(64, return_sequences=False),
+        Dropout(0.2),
+        Dense(32, activation="relu"),
+        Dense(1),                           # predict next Close price
+    ])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    model.summary()
+    return model
+
+
+def build_simple_model(input_shape: tuple):
+    """
+    Fallback model using only NumPy (when TensorFlow unavailable).
+    Implements a simple linear regression on the last closing price.
+
+    This is a demo substitute — not as powerful as LSTM.
+    """
+    class SimpleModel:
+        def fit(self, X, y, **kwargs):
+            # Use last Close value of each sequence as prediction (naive baseline)
+            self.X_train = X
+            self.y_train = y
+            return self
+
+        def predict(self, X):
+            # Predict = last Close in each sequence (index 0 of last timestep)
+            return X[:, -1, 0]
+
+        def summary(self):
+            print("    [SimpleModel] Naive last-value predictor (TF not installed)")
+
+    return SimpleModel()
+
+
+def train_model(X_train, y_train, X_test, y_test):
+    """
+    Train the LSTM (or fallback) model.
+
+    Args:
+        X_train, y_train : Training sequences and targets
+        X_test,  y_test  : Test sequences and targets
+
+    Returns:
+        Trained model
+    """
+    print("\n[4/6] Building and training model...")
+    input_shape = (X_train.shape[1], X_train.shape[2])
+
+    if KERAS_AVAILABLE:
+        model = build_lstm_model(input_shape)
+        early_stop = EarlyStopping(
+            monitor="val_loss", patience=5, restore_best_weights=True
+        )
+        model.fit(
+            X_train, y_train,
+            validation_data=(X_test, y_test),
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            callbacks=[early_stop],
+            verbose=1,
+        )
+    else:
+        print("    TensorFlow not found — using simple baseline model.")
+        model = build_simple_model(input_shape)
+        model.fit(X_train, y_train)
+
+    print("    Training complete ✓")
+    return model
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — EVALUATION (RMSE + BACKTEST)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_model(model, X_test, y_test, scaler_close) -> tuple:
+    """
+    Evaluate the model using RMSE and a simple backtest strategy.
+
+    RMSE (Root Mean Squared Error):
+        Lower is better. Measured in the original price scale (dollars).
+
+    Backtest Strategy:
+        Buy when predicted price > today's price.
+        Sell otherwise.
+        Compare cumulative return vs. buy-and-hold.
+
+    Args:
+        model        : Trained model
+        X_test       : Test sequences
+        y_test       : True scaled targets
+        scaler_close : Fitted MinMaxScaler for Close
+
+    Returns:
+        Tuple of (y_pred_prices, y_true_prices) in original dollar scale
+    """
+    print("\n[5/6] Evaluating model...")
+
+    y_pred_scaled = model.predict(X_test).flatten()
+
+    # Inverse-transform to original price scale
+    y_pred_prices = scaler_close.inverse_transform(
+        y_pred_scaled.reshape(-1, 1)
+    ).flatten()
+    y_true_prices = scaler_close.inverse_transform(
+        y_test.reshape(-1, 1)
+    ).flatten()
+
+    rmse = np.sqrt(mean_squared_error(y_true_prices, y_pred_prices))
+    mape = np.mean(np.abs((y_true_prices - y_pred_prices) / y_true_prices)) * 100
+
+    print("\n" + "═" * 50)
+    print("  MODEL EVALUATION RESULTS")
+    print("═" * 50)
+    print(f"  RMSE : ${rmse:.2f}  (avg prediction error in dollars)")
+    print(f"  MAPE : {mape:.2f}%  (mean absolute percentage error)")
+    print("═" * 50)
+
+    # Simple backtest
+    signals    = np.sign(np.diff(y_pred_prices))          # +1 buy / -1 sell
+    true_moves = np.diff(y_true_prices)
+    correct    = np.sum(signals == np.sign(true_moves))
+    direction_acc = correct / len(signals) * 100
+
+    print(f"\n  Backtest — Direction Accuracy: {direction_acc:.1f}%")
+    print(f"  (Predicted the correct direction {correct}/{len(signals)} times)")
+
+    return y_pred_prices, y_true_prices
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — VISUALIZATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def visualize(df: pd.DataFrame, y_pred: np.ndarray, y_true: np.ndarray,
+              split_idx: int, save_path: str = PLOT_PATH):
+    """
+    Plot actual vs. predicted stock prices along with technical indicators.
+
+    Args:
+        df        : Full DataFrame (for indicator plots)
+        y_pred    : Predicted closing prices (test set)
+        y_true    : Actual closing prices (test set)
+        split_idx : Index where training data ends
+        save_path : File path to save the PNG
+    """
+    print(f"\n[6/6] Generating visualization → {save_path}")
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    fig.suptitle(f"Stock Price Prediction — {TICKER}", fontsize=16, fontweight="bold")
+
+    # ── Plot 1: Actual vs Predicted (test period only) ──────────
+    ax1 = axes[0]
+    test_range = range(len(y_true))
+    ax1.plot(test_range, y_true,  label="Actual Price",    color="#1f77b4", linewidth=1.5)
+    ax1.plot(test_range, y_pred,  label="Predicted Price", color="#ff7f0e",
+             linewidth=1.5, linestyle="--")
+    ax1.fill_between(test_range, y_true, y_pred, alpha=0.1, color="gray")
+    ax1.set_title("Actual vs. Predicted Closing Price (Test Set)")
+    ax1.set_ylabel("Price (USD)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # ── Plot 2: Full history + moving averages ───────────────────
+    ax2 = axes[1]
+    ax2.plot(df.index, df["Close"],  label="Close",  color="#1f77b4", linewidth=1,   alpha=0.8)
+    ax2.plot(df.index, df["SMA_20"], label="SMA 20", color="#2ca02c", linewidth=1.5, linestyle="-.")
+    ax2.plot(df.index, df["SMA_50"], label="SMA 50", color="#d62728", linewidth=1.5, linestyle="--")
+    ax2.axvline(x=df.index[split_idx + SEQ_LENGTH], color="black",
+                linestyle=":", linewidth=1.5, label="Train/Test Split")
+    ax2.set_title("Historical Prices with Moving Averages")
+    ax2.set_ylabel("Price (USD)")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # ── Plot 3: RSI ──────────────────────────────────────────────
+    ax3 = axes[2]
+    ax3.plot(df.index, df["RSI_14"], label="RSI (14)", color="#9467bd", linewidth=1)
+    ax3.axhline(70, color="red",   linestyle="--", linewidth=1, label="Overbought (70)")
+    ax3.axhline(30, color="green", linestyle="--", linewidth=1, label="Oversold (30)")
+    ax3.fill_between(df.index, df["RSI_14"], 70,
+                     where=(df["RSI_14"] >= 70), alpha=0.2, color="red")
+    ax3.fill_between(df.index, df["RSI_14"], 30,
+                     where=(df["RSI_14"] <= 30), alpha=0.2, color="green")
+    ax3.set_title("RSI — Relative Strength Index (14-day)")
+    ax3.set_ylabel("RSI")
+    ax3.set_ylim(0, 100)
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"    Saved → {save_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 60)
+    print("  STOCK PRICE PREDICTION — AI & ML Internship Project")
+    print("=" * 60)
+
+    # ── 1. Load data ──────────────────────────────────────────
+    df_raw = fetch_stock_data(TICKER, START_DATE, END_DATE)
+
+    # ── 2. Add indicators ─────────────────────────────────────
+    df = add_technical_indicators(df_raw)
+
+    # ── 3. Preprocess ─────────────────────────────────────────
+    X_train, X_test, y_train, y_test, scaler_close, split_idx = preprocess(df)
+
+    # ── 4. Train ──────────────────────────────────────────────
+    model = train_model(X_train, y_train, X_test, y_test)
+
+    # ── 5. Evaluate ───────────────────────────────────────────
+    y_pred, y_true = evaluate_model(model, X_test, y_test, scaler_close)
+
+    # ── 6. Visualize ──────────────────────────────────────────
+    visualize(df, y_pred, y_true, split_idx)
+
+    print("\n✓ Project complete.")
+    print(f"  Prediction plot saved to: {PLOT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
